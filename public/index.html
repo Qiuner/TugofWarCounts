@@ -36,7 +36,7 @@
             <button id="createRoomBtn" class="btn btn-accent">创建房间</button>
             <button id="joinRoomBtn" class="btn btn-secondary">加入房间</button>
           </div>
-          <p class="hint">房主创建房间后，把房间号发给另一位玩家。</p>
+          <p class="hint">部署到服务器后，把房间链接发给另一位玩家，对方打开网站即可进入同一房间。</p>
         </div>
       </div>
 
@@ -79,6 +79,14 @@
           <div><span class="meta-label">我的队伍</span><strong id="teamText">-</strong></div>
           <div><span class="meta-label">阶段</span><strong id="phaseText">未加入</strong></div>
         </div>
+        <div class="share-card">
+          <span class="meta-label">邀请链接</span>
+          <div id="roomLinkText" class="room-link">-</div>
+          <div class="button-row compact-row">
+            <button id="copyRoomLinkBtn" class="btn btn-secondary" disabled>复制房间链接</button>
+          </div>
+          <p id="roomTipsText" class="hint">创建房间后可复制邀请链接给另一位玩家。</p>
+        </div>
         <div class="team-list">
           <div class="team-box blue-box"><span>蓝队</span><strong id="bluePlayerText">空位</strong></div>
           <div class="team-box red-box"><span>红队</span><strong id="redPlayerText">空位</strong></div>
@@ -99,7 +107,7 @@
       <main class="game-layout">
         <aside class="side-card blue-side">
           <div class="side-head">
-            <span>蓝队</span>
+            <span id="mySideLabelBlue">蓝队</span>
             <strong id="blueProgressText">答 0 / 0</strong>
           </div>
           <div id="myQuestionCardBlue" class="question-card inactive">
@@ -129,7 +137,7 @@
 
         <aside class="side-card red-side">
           <div class="side-head">
-            <span>红队</span>
+            <span id="mySideLabelRed">红队</span>
             <strong id="redProgressText">答 0 / 0</strong>
           </div>
           <div id="myQuestionCardRed" class="question-card inactive">

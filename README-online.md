@@ -1,6 +1,6 @@
 # 数学大拔河联机版
 
-这是在原始单机项目旁边新增的一套联机版骨架，不覆盖原有 [TugofWarCounts.html](/E:/TugofWarCounts/TugofWarCounts.html:1)。
+这是在原始单机项目旁边新增的一套公网可部署联机版，不覆盖原有 [TugofWarCounts.html](/E:/TugofWarCounts/TugofWarCounts.html:1)。
 
 ## 结构
 
@@ -8,12 +8,17 @@
   - Node HTTP 服务
   - WebSocket 房间同步
   - 服务端判题、计时、胜负结算
+  - 会话保持、掉线重连、房间过期清理
 - `public/index.html`
   - 联机大厅和比赛界面
 - `public/app.js`
-  - 前端房间逻辑、答题输入、状态渲染
+  - 前端房间逻辑、答题输入、状态渲染、自动重连、分享链接
 - `public/styles.css`
   - 联机版样式
+- `ecosystem.config.js`
+  - PM2 启动配置
+- `deploy.nginx.conf`
+  - Nginx 反向代理示例
 
 ## 启动
 
@@ -30,122 +35,198 @@ http://localhost:3000
 
 如果 `3000` 端口被占用，可以换端口：
 
-```bash
-set PORT=3011 && npm start
-```
-
-PowerShell:
-
 ```powershell
 $env:PORT=3011
 npm start
 ```
 
+## 怎么实现公网双人对战
+
+这套联机版采用“服务端权威”的实现方式：
+
+- 两个用户都访问同一个网站
+- 两个浏览器都连接到同一台 Node 服务器
+- 服务端负责房间、题目、计时、判题、比分、绳子位置和胜负结算
+
+不是浏览器互相直连，而是：
+
+- 用户 A 浏览器
+- WebSocket
+- 你的服务器
+- WebSocket
+- 用户 B 浏览器
+
+### 进入同一个房间的方式
+
+1. 用户 A 打开网站后创建房间
+2. 服务器生成一个 5 位房间号
+3. 前端会生成一个可分享的房间链接
+4. 用户 A 把这个链接发给用户 B
+5. 用户 B 打开链接后，页面会自动带上房间号并加入同一房间
+6. 房主点击开始，双方进入同一局比赛
+
+### 服务端负责什么
+
+- 创建和销毁房间
+- 把房主分配到蓝队，把第二位玩家分配到红队
+- 统一生成题目
+- 校验答案
+- 统一计时
+- 统一更新拔河绳位置
+- 广播房间状态给双方
+
+### 前端负责什么
+
+- 输入昵称
+- 创建或加入房间
+- 展示邀请链接
+- 输入答案并提交
+- 根据服务端状态刷新界面
+- 自动尝试重连
+
 ## 当前能力
 
 - 创建 2 人房间
 - 房间号加入
+- 分享房间链接加入
 - 房主配置时长、题数、难度
 - 服务端统一出题
 - 服务端判题和计时
 - 双端同步比分、绳子位置、胜负结果
+- 浏览器刷新或掉线后，30 秒内可重连原座位
+- 长时间无人房间自动清理
 
-## 怎么实现联机
+## 部署到服务器
 
-这套联机版采用的是“服务端权威”的实现方式，不是两个浏览器各自本地算结果再互相通知。
+最简单的生产部署方案：
 
-整体分成两部分：
+1. 准备一台云服务器
+2. 安装 Node.js 20+
+3. 拉取仓库代码
+4. 运行 `npm install`
+5. 使用 PM2 启动服务
+6. 使用 Nginx 做反向代理
+7. 配置域名和 HTTPS
 
-- `public/app.js`
-  - 负责大厅、房间、比赛界面渲染
-  - 负责采集玩家输入
-  - 通过 WebSocket 把“创建房间、加入房间、提交答案、修改配置、开始游戏”等事件发给服务端
-- `server.js`
-  - 负责维护房间和玩家分组
-  - 负责生成题目
-  - 负责统一计时
-  - 负责判题、加分、更新拔河绳位置
-  - 负责广播最新比赛状态给两端
+### PM2 启动
 
-### 房间模型
+```bash
+npm install -g pm2
+pm2 start ecosystem.config.js
+pm2 save
+```
 
-- 一个房间只有两名玩家
-- 创建房间的用户默认是蓝队，也是房主
-- 第二个加入的用户自动进入红队
-- 房主可以修改配置并开始比赛
+### 健康检查
 
-### 实时同步方式
+服务端提供：
 
-前端和服务端之间通过 WebSocket 长连接通信。
+```text
+/healthz
+```
 
-主要消息包括：
+### Nginx
 
-- `hello`
-  - 客户端连接后上报昵称
-- `room:create`
-  - 创建房间
-- `room:join`
-  - 按房间号加入
-- `room:update-config`
-  - 房主修改时长、题数、难度
-- `game:start`
-  - 房主开始比赛
-- `answer:submit`
-  - 玩家提交答案
-- `room:state`
-  - 服务端把当前房间状态广播给客户端
+示例配置见：
 
-### 为什么要服务端判题
+- [deploy.nginx.conf](/E:/TugofWarCounts/deploy.nginx.conf:1)
 
-如果继续沿用原来单机版的“浏览器本地出题、本地判题”方式，联机时会出现几个问题：
+部署时别忘了允许 WebSocket 升级头。
 
-- 两边题目可能不一致
-- 计时可能漂移
-- 分数和绳子位置容易不同步
-- 浏览器本地变量很容易被改，无法防作弊
+## Docker 部署
 
-所以现在改成：
+如果你想直接把项目打成镜像丢到自己的服务器，现在已经可以。
 
-- 题目由服务端生成
-- 答案由服务端校验
-- 时间由服务端控制
-- 胜负由服务端结算
-- 客户端只负责显示和输入
+项目里新增了：
 
-### 一局比赛的流程
+- [Dockerfile](/E:/TugofWarCounts/Dockerfile:1)
+- [.dockerignore](/E:/TugofWarCounts/.dockerignore:1)
 
-1. 玩家 A 连接后创建房间
-2. 服务端生成房间号，并把玩家 A 设为蓝队
-3. 玩家 B 输入房间号加入，服务端把玩家 B 设为红队
-4. 房主设置比赛参数并点击开始
-5. 服务端初始化比赛状态，并分别给蓝队和红队分配当前题目
-6. 玩家提交答案时，服务端立即判定对错
-7. 如果答对，服务端更新分数、答题数和绳子位置，并给该玩家发下一题
-8. 服务端持续广播 `room:state`，两端界面同步刷新
-9. 达到题数、绳子越界或倒计时结束后，服务端统一结算胜负
+### 本地构建镜像
 
-### 当前这版的边界
+```bash
+docker build -t tugofwarcounts:latest .
+```
 
-当前联机版已经实现“局域网/本机双端实时对战”的主链路，但还没有做这些增强项：
+### 本地运行容器
 
-- 断线重连
-- 房间保活
-- 自定义 Excel 题库上传到服务端
-- 多房间后台管理
-- 更细的反作弊策略
+```bash
+docker run -d --name tugofwarcounts -p 3000:3000 tugofwarcounts:latest
+```
 
-因此现在更适合先作为“教室局域网联机版”或“同一台机器开两个浏览器窗口测试版”。
+启动后访问：
+
+```text
+http://localhost:3000
+```
+
+### 带环境变量运行
+
+```bash
+docker run -d \
+  --name tugofwarcounts \
+  -p 3000:3000 \
+  -e PORT=3000 \
+  -e ROOM_IDLE_MS=600000 \
+  -e RECONNECT_GRACE_MS=30000 \
+  tugofwarcounts:latest
+```
+
+### 服务器上的典型流程
+
+1. 把项目拉到服务器
+2. 执行 `docker build -t tugofwarcounts:latest .`
+3. 执行 `docker run -d --name tugofwarcounts -p 3000:3000 tugofwarcounts:latest`
+4. 用 Nginx 或 Caddy 反向代理到容器的 `3000` 端口
+5. 配域名和 HTTPS
+
+### 更新版本
+
+```bash
+docker stop tugofwarcounts
+docker rm tugofwarcounts
+docker build -t tugofwarcounts:latest .
+docker run -d --name tugofwarcounts -p 3000:3000 tugofwarcounts:latest
+```
+
+## 推荐上线形态
+
+- `Node.js` 跑 `server.js`
+- `PM2` 做进程守护
+- `Nginx` 做反向代理
+- `HTTPS + WSS` 提供公网访问
+
+用户最终访问：
+
+```text
+https://your-domain.com/public/index.html
+```
+
+或者你也可以直接把 `/` 指向首页，让用户只访问域名根路径。
+
+## 环境变量
+
+- `PORT`
+  - 服务端端口，默认 `3000`
+- `ROOM_IDLE_MS`
+  - 房间空闲多久自动清理，默认 `600000`
+- `RECONNECT_GRACE_MS`
+  - 掉线后座位保留时间，默认 `30000`
+- `CLEANUP_INTERVAL_MS`
+  - 清理任务运行周期
+- `HEARTBEAT_INTERVAL_MS`
+  - WebSocket 心跳周期
 
 ## 当前限制
 
-- 还没接入 Excel 自定义题库上传
-- 还没做断线重连
-- 还没做观战/多房主控台
-- 还没把原单机混淆脚本重构成可复用模块
+- 还没接入 Excel 自定义题库上传到服务端
+- 还没有数据库持久化
+- 还没有用户系统
+- 还没有观战模式
+- 还没有更细的限流和反作弊策略
 
 ## 建议下一步
 
-1. 接入 Excel 上传并把题库发到服务端
-2. 做断线重连和房间保活
-3. 抽离一份 `shared/game-rules.js`，让前后端共享规则
-4. 再考虑部署到公网或校园局域网
+1. 接入 Excel 上传并把题库同步到服务端
+2. 增加基础限流和日志
+3. 加 Redis 或数据库做房间持久化
+4. 增加观战和战绩记录

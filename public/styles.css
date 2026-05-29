@@ -198,6 +198,28 @@ select {
   margin-top: 16px;
 }
 
+.share-card {
+  margin-bottom: 16px;
+  padding: 14px;
+  border-radius: 20px;
+  background: rgba(232, 240, 255, 0.8);
+}
+
+.room-link {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: white;
+  color: #17396d;
+  font-size: 14px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.compact-row {
+  grid-template-columns: minmax(0, 220px);
+}
+
 .room-meta {
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   margin-bottom: 16px;
@@ -284,6 +306,11 @@ select {
   padding: 18px;
 }
 
+.side-card {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+}
+
 .side-head {
   display: flex;
   justify-content: space-between;
@@ -303,6 +330,30 @@ select {
 
 .question-card.inactive {
   opacity: 0.45;
+}
+
+.side-card:not(.active-side) .question-card.inactive {
+  opacity: 1;
+}
+
+.side-card.active-side .question-card {
+  border-color: var(--gold);
+  box-shadow: inset 0 0 0 2px rgba(255, 184, 0, 0.25);
+}
+
+.side-card.opponent-side .question-card {
+  background: #f4f7fb;
+  border-style: dashed;
+}
+
+.side-card.opponent-side .question-text {
+  color: #9aa7ba;
+  font-size: 26px;
+}
+
+.side-card.opponent-side .result-box {
+  background: #eef3f8;
+  color: #708095;
 }
 
 .question-tag {

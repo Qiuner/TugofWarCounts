@@ -4,8 +4,13 @@ const path = require("path");
 const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const ROOT = __dirname;
+const ROOM_IDLE_MS = Number(process.env.ROOM_IDLE_MS) || 10 * 60 * 1000;
+const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS) || 30 * 1000;
+const CLEANUP_INTERVAL_MS = Number(process.env.CLEANUP_INTERVAL_MS) || 15 * 1000;
+const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS) || 20 * 1000;
+
 const MIME_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -37,7 +42,7 @@ const DIFFICULTIES = [
 ];
 
 const rooms = new Map();
-const clients = new Map();
+const liveClients = new Map();
 
 function randomInt(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -45,6 +50,10 @@ function randomInt(min, max) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function now() {
+  return Date.now();
 }
 
 function createRoomCode() {
@@ -56,8 +65,12 @@ function createRoomCode() {
   return code;
 }
 
-function createClientId() {
-  return crypto.randomBytes(8).toString("hex");
+function createId(bytes = 16) {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
+function roomUrl(roomCode) {
+  return `/public/index.html?room=${encodeURIComponent(roomCode)}`;
 }
 
 function createQuestionBank(config) {
@@ -176,23 +189,29 @@ function generateQuestion(difficulty, lastText) {
   return { text: "1 + 1", answer: 2 };
 }
 
-function nextQuestion(room, team) {
-  const state = room.state;
-  const bank = room.config.questionBank;
+function createPlayerSlot(sessionId, name) {
+  return {
+    sessionId,
+    name,
+    connected: true,
+    disconnectedAt: null,
+    reconnectUntil: null
+  };
+}
 
-  if (bank.length > 0) {
-    const lastText = state.lastQuestionText[team];
-    const choices = bank.filter((item) => item.text !== lastText);
-    const source = choices.length > 0 ? choices : bank;
-    const pick = source[randomInt(0, source.length - 1)];
-    state.lastQuestionText[team] = pick.text;
-    state.currentQuestion[team] = { text: pick.text, answer: pick.answer };
-    return;
-  }
+function sanitizeConfig(input) {
+  const duration = clamp(Number(input.duration) || 45, 30, 180);
+  const targetQuestions = clamp(Number(input.targetQuestions) || 10, 1, 50);
+  const difficulty = DIFFICULTIES.includes(input.difficulty) ? input.difficulty : "10以内加法";
+  const importedQuestions = Array.isArray(input.importedQuestions) ? input.importedQuestions : [];
 
-  const generated = generateQuestion(room.config.difficulty, state.lastQuestionText[team]);
-  state.lastQuestionText[team] = generated.text;
-  state.currentQuestion[team] = generated;
+  return {
+    duration,
+    targetQuestions,
+    difficulty,
+    importedQuestions,
+    questionBank: createQuestionBank({ importedQuestions })
+  };
 }
 
 function initialRoomState(config) {
@@ -220,19 +239,53 @@ function initialRoomState(config) {
   };
 }
 
-function sanitizeConfig(input) {
-  const duration = clamp(Number(input.duration) || 45, 30, 180);
-  const targetQuestions = clamp(Number(input.targetQuestions) || 10, 1, 50);
-  const difficulty = DIFFICULTIES.includes(input.difficulty) ? input.difficulty : "10以内加法";
-  const importedQuestions = Array.isArray(input.importedQuestions) ? input.importedQuestions : [];
+function touchRoom(room) {
+  room.updatedAt = now();
+}
 
-  return {
-    duration,
-    targetQuestions,
-    difficulty,
-    importedQuestions,
-    questionBank: createQuestionBank({ importedQuestions })
-  };
+function getPlayerSlot(room, team) {
+  return room.players[team];
+}
+
+function getTeamBySession(room, sessionId) {
+  if (room.players.blue && room.players.blue.sessionId === sessionId) {
+    return "blue";
+  }
+  if (room.players.red && room.players.red.sessionId === sessionId) {
+    return "red";
+  }
+  return null;
+}
+
+function getConnectedClient(sessionId) {
+  return liveClients.get(sessionId) || null;
+}
+
+function sendToSession(sessionId, payload) {
+  const client = getConnectedClient(sessionId);
+  if (!client || client.socket.readyState !== 1) {
+    return;
+  }
+  client.socket.send(JSON.stringify(payload));
+}
+
+function nextQuestion(room, team) {
+  const state = room.state;
+  const bank = room.config.questionBank;
+
+  if (bank.length > 0) {
+    const lastText = state.lastQuestionText[team];
+    const choices = bank.filter((item) => item.text !== lastText);
+    const source = choices.length > 0 ? choices : bank;
+    const pick = source[randomInt(0, source.length - 1)];
+    state.lastQuestionText[team] = pick.text;
+    state.currentQuestion[team] = { text: pick.text, answer: pick.answer };
+    return;
+  }
+
+  const generated = generateQuestion(room.config.difficulty, state.lastQuestionText[team]);
+  state.lastQuestionText[team] = generated.text;
+  state.currentQuestion[team] = generated;
 }
 
 function createRoom(hostClient, payload) {
@@ -240,10 +293,12 @@ function createRoom(hostClient, payload) {
   const config = sanitizeConfig(payload || {});
   const room = {
     code,
-    hostId: hostClient.id,
+    createdAt: now(),
+    updatedAt: now(),
+    hostSessionId: hostClient.sessionId,
     config,
     players: {
-      blue: hostClient.id,
+      blue: createPlayerSlot(hostClient.sessionId, hostClient.name),
       red: null
     },
     state: initialRoomState(config)
@@ -255,48 +310,53 @@ function createRoom(hostClient, payload) {
   return room;
 }
 
+function getPlayerState(slot) {
+  if (!slot) {
+    return null;
+  }
+  return {
+    name: slot.name,
+    connected: slot.connected,
+    reconnectUntil: slot.reconnectUntil
+  };
+}
+
 function serializeRoomFor(client) {
   const room = rooms.get(client.roomCode);
-  if (!room) {
+  if (!room || !client.team) {
     return null;
   }
 
-  const state = room.state;
   const opponentTeam = client.team === "blue" ? "red" : "blue";
-  const now = Date.now();
-  const timeLeftMs = state.endsAt ? Math.max(0, state.endsAt - now) : room.config.duration * 1000;
-  const players = {
-    blue: room.players.blue ? clients.get(room.players.blue)?.name || "玩家1" : null,
-    red: room.players.red ? clients.get(room.players.red)?.name || "玩家2" : null
-  };
+  const currentTime = now();
+  const timeLeftMs = room.state.endsAt ? Math.max(0, room.state.endsAt - currentTime) : room.config.duration * 1000;
 
   return {
     type: "room:state",
     roomCode: room.code,
-    phase: state.phase,
+    roomPath: roomUrl(room.code),
+    phase: room.state.phase,
     team: client.team,
-    isHost: room.hostId === client.id,
-    players,
-    config: state.configSnapshot,
-    scores: state.scores,
-    totalAnswered: state.totalAnswered,
-    ropePos: state.ropePos,
+    isHost: room.hostSessionId === client.sessionId,
+    players: {
+      blue: getPlayerState(room.players.blue),
+      red: getPlayerState(room.players.red)
+    },
+    config: room.state.configSnapshot,
+    scores: room.state.scores,
+    totalAnswered: room.state.totalAnswered,
+    ropePos: room.state.ropePos,
     timeLeftMs,
-    currentQuestion: state.currentQuestion[client.team]
-      ? { text: state.currentQuestion[client.team].text }
+    currentQuestion: room.state.currentQuestion[client.team]
+      ? { text: room.state.currentQuestion[client.team].text }
       : null,
-    opponentQuestionActive: Boolean(state.currentQuestion[opponentTeam]),
-    result: state.lastResult[client.team],
-    opponentResult: state.lastResult[opponentTeam],
-    winner: state.winner
+    opponentQuestionActive: Boolean(room.state.currentQuestion[opponentTeam]),
+    result: room.state.lastResult[client.team],
+    opponentResult: room.state.lastResult[opponentTeam],
+    winner: room.state.winner,
+    canStart: Boolean(room.players.blue && room.players.red),
+    reconnectGraceMs: RECONNECT_GRACE_MS
   };
-}
-
-function send(client, payload) {
-  if (!client || client.socket.readyState !== 1) {
-    return;
-  }
-  client.socket.send(JSON.stringify(payload));
 }
 
 function broadcastRoom(roomCode) {
@@ -306,19 +366,26 @@ function broadcastRoom(roomCode) {
   }
 
   ["blue", "red"].forEach((team) => {
-    const clientId = room.players[team];
-    if (!clientId) {
+    const slot = room.players[team];
+    if (!slot) {
       return;
     }
-    const client = clients.get(clientId);
+    const client = getConnectedClient(slot.sessionId);
     if (!client) {
       return;
     }
     const payload = serializeRoomFor(client);
     if (payload) {
-      send(client, payload);
+      sendToSession(slot.sessionId, payload);
     }
   });
+}
+
+function clearGameTimer(room) {
+  if (room.state.timer) {
+    clearInterval(room.state.timer);
+    room.state.timer = null;
+  }
 }
 
 function endGame(room, winner) {
@@ -329,22 +396,21 @@ function endGame(room, winner) {
   room.state.gameEnded = true;
   room.state.phase = "finished";
   room.state.winner = winner;
-  if (room.state.timer) {
-    clearInterval(room.state.timer);
-    room.state.timer = null;
-  }
+  clearGameTimer(room);
+  touchRoom(room);
 }
 
 function startGame(room) {
   room.state = initialRoomState(room.config);
   room.state.phase = "playing";
-  room.state.startedAt = Date.now();
+  room.state.startedAt = now();
   room.state.endsAt = room.state.startedAt + room.config.duration * 1000;
   nextQuestion(room, "blue");
   nextQuestion(room, "red");
+  touchRoom(room);
 
   room.state.timer = setInterval(() => {
-    if (Date.now() >= room.state.endsAt) {
+    if (now() >= room.state.endsAt) {
       const winner = room.state.scores.blue >= room.state.scores.red ? "blue" : "red";
       endGame(room, winner);
     }
@@ -352,87 +418,166 @@ function startGame(room) {
   }, 250);
 }
 
-function handleSubmit(client, payload) {
-  const room = rooms.get(client.roomCode);
-  if (!room || room.state.phase !== "playing" || room.state.gameEnded) {
+function assignHost(room) {
+  if (room.players.blue) {
+    room.hostSessionId = room.players.blue.sessionId;
+    return;
+  }
+  if (room.players.red) {
+    room.hostSessionId = room.players.red.sessionId;
+    return;
+  }
+  room.hostSessionId = null;
+}
+
+function removePlayerFromRoom(room, team) {
+  const slot = room.players[team];
+  if (!slot) {
     return;
   }
 
-  const team = client.team;
-  if (!team) {
+  room.players[team] = null;
+  room.state.currentQuestion[team] = null;
+  room.state.lastQuestionText[team] = "";
+  room.state.lastResult[team] = { type: "idle", at: 0 };
+
+  if (room.hostSessionId === slot.sessionId) {
+    assignHost(room);
+  }
+
+  if (!room.players.blue && !room.players.red) {
+    clearGameTimer(room);
+    rooms.delete(room.code);
     return;
   }
 
-  const current = room.state.currentQuestion[team];
-  if (!current) {
-    return;
-  }
-
-  room.state.totalAnswered[team] += 1;
-  const submitted = Number(payload.answer);
-  const correct = Number.isFinite(submitted) && submitted === current.answer;
-  room.state.lastResult[team] = { type: correct ? "correct" : "wrong", at: Date.now() };
-
-  if (correct) {
-    room.state.scores[team] += 1;
-    room.state.ropePos += team === "blue" ? -10 : 10;
-    room.state.ropePos = clamp(room.state.ropePos, -70, 70);
-
-    if (room.state.scores[team] >= room.config.targetQuestions) {
-      endGame(room, team);
-    } else if (Math.abs(room.state.ropePos) >= 60) {
-      endGame(room, room.state.ropePos > 0 ? "red" : "blue");
-    } else {
-      nextQuestion(room, team);
-    }
-  }
-
-  if (!room.state.gameEnded && Date.now() >= room.state.endsAt) {
-    const winner = room.state.scores.blue >= room.state.scores.red ? "blue" : "red";
-    endGame(room, winner);
-  }
-
-  broadcastRoom(room.code);
+  clearGameTimer(room);
+  room.state.phase = "lobby";
+  room.state.gameEnded = false;
+  room.state.winner = null;
+  room.state.currentQuestion = { blue: null, red: null };
+  touchRoom(room);
 }
 
 function leaveRoom(client) {
   const roomCode = client.roomCode;
   if (!roomCode) {
+    client.roomCode = null;
+    client.team = null;
     return;
   }
 
   const room = rooms.get(roomCode);
+  const team = client.team;
   client.roomCode = null;
   client.team = null;
+  if (!room || !team) {
+    return;
+  }
+
+  removePlayerFromRoom(room, team);
+  if (rooms.has(roomCode)) {
+    broadcastRoom(roomCode);
+  }
+}
+
+function disconnectClient(client) {
+  liveClients.delete(client.sessionId);
+  if (!client.roomCode || !client.team) {
+    return;
+  }
+
+  const room = rooms.get(client.roomCode);
   if (!room) {
     return;
   }
 
-  if (room.players.blue === client.id) {
-    room.players.blue = null;
-  }
-  if (room.players.red === client.id) {
-    room.players.red = null;
+  const slot = getPlayerSlot(room, client.team);
+  if (!slot || slot.sessionId !== client.sessionId) {
+    return;
   }
 
-  if (room.state.timer) {
-    clearInterval(room.state.timer);
-    room.state.timer = null;
-  }
+  slot.connected = false;
+  slot.disconnectedAt = now();
+  slot.reconnectUntil = slot.disconnectedAt + RECONNECT_GRACE_MS;
 
-  if (!room.players.blue && !room.players.red) {
-    rooms.delete(room.code);
-  } else {
+  clearGameTimer(room);
+  if (room.state.phase === "playing") {
     room.state.phase = "lobby";
-    room.state.gameEnded = false;
-    room.state.winner = null;
-    broadcastRoom(room.code);
   }
+  touchRoom(room);
+  broadcastRoom(room.code);
 }
 
-function detachClient(client) {
-  leaveRoom(client);
-  clients.delete(client.id);
+function restoreClientMembership(client) {
+  for (const room of rooms.values()) {
+    const team = getTeamBySession(room, client.sessionId);
+    if (!team) {
+      continue;
+    }
+    const slot = getPlayerSlot(room, team);
+    slot.connected = true;
+    slot.disconnectedAt = null;
+    slot.reconnectUntil = null;
+    slot.name = client.name;
+    client.roomCode = room.code;
+    client.team = team;
+    touchRoom(room);
+    return room;
+  }
+  return null;
+}
+
+function attachClientToSlot(client, room, team) {
+  const slot = getPlayerSlot(room, team);
+  slot.connected = true;
+  slot.disconnectedAt = null;
+  slot.reconnectUntil = null;
+  slot.name = client.name;
+  client.roomCode = room.code;
+  client.team = team;
+  touchRoom(room);
+}
+
+function handleSubmit(client, payload) {
+  const room = rooms.get(client.roomCode);
+  if (!room || room.state.phase !== "playing" || room.state.gameEnded || !client.team) {
+    return;
+  }
+
+  const current = room.state.currentQuestion[client.team];
+  if (!current) {
+    return;
+  }
+
+  room.state.totalAnswered[client.team] += 1;
+  const submitted = Number(payload.answer);
+  const correct = Number.isFinite(submitted) && submitted === current.answer;
+  room.state.lastResult[client.team] = { type: correct ? "correct" : "wrong", at: now() };
+
+  if (correct) {
+    room.state.scores[client.team] += 1;
+    room.state.ropePos += client.team === "blue" ? -10 : 10;
+    room.state.ropePos = clamp(room.state.ropePos, -70, 70);
+
+    if (room.state.scores[client.team] >= room.config.targetQuestions) {
+      endGame(room, client.team);
+    } else if (Math.abs(room.state.ropePos) >= 60) {
+      endGame(room, room.state.ropePos > 0 ? "red" : "blue");
+    }
+  }
+
+  if (!room.state.gameEnded && now() >= room.state.endsAt) {
+    const winner = room.state.scores.blue >= room.state.scores.red ? "blue" : "red";
+    endGame(room, winner);
+  }
+
+  if (!room.state.gameEnded) {
+    nextQuestion(room, client.team);
+  }
+
+  touchRoom(room);
+  broadcastRoom(room.code);
 }
 
 function handleMessage(client, rawMessage) {
@@ -440,18 +585,39 @@ function handleMessage(client, rawMessage) {
   try {
     message = JSON.parse(rawMessage.toString());
   } catch (error) {
-    send(client, { type: "error", message: "消息格式错误" });
+    sendToSession(client.sessionId, { type: "error", message: "消息格式错误" });
     return;
   }
 
   switch (message.type) {
-    case "hello":
-      client.name = typeof message.name === "string" && message.name.trim() ? message.name.trim().slice(0, 16) : "玩家";
-      send(client, { type: "hello:ok", clientId: client.id, name: client.name });
+    case "hello": {
+      const requestedSessionId = typeof message.sessionId === "string" && /^[a-f0-9]{32}$/i.test(message.sessionId)
+        ? message.sessionId
+        : createId();
+
+      if (requestedSessionId !== client.sessionId) {
+        liveClients.delete(client.sessionId);
+        client.sessionId = requestedSessionId;
+        liveClients.set(client.sessionId, client);
+      }
+
+      client.name = typeof message.name === "string" && message.name.trim()
+        ? message.name.trim().slice(0, 16)
+        : "玩家";
+      const room = restoreClientMembership(client);
+      sendToSession(client.sessionId, {
+        type: "hello:ok",
+        sessionId: client.sessionId,
+        name: client.name
+      });
+      if (room) {
+        broadcastRoom(room.code);
+      }
       break;
+    }
     case "room:create": {
       if (client.roomCode) {
-        send(client, { type: "error", message: "你已经在房间中" });
+        sendToSession(client.sessionId, { type: "error", message: "你已经在房间中" });
         return;
       }
       const room = createRoom(client, message.config || {});
@@ -460,42 +626,40 @@ function handleMessage(client, rawMessage) {
     }
     case "room:join": {
       if (client.roomCode) {
-        send(client, { type: "error", message: "你已经在房间中" });
+        sendToSession(client.sessionId, { type: "error", message: "你已经在房间中" });
         return;
       }
       const code = String(message.roomCode || "").trim().toUpperCase();
       const room = rooms.get(code);
       if (!room) {
-        send(client, { type: "error", message: "房间不存在" });
+        sendToSession(client.sessionId, { type: "error", message: "房间不存在或已过期" });
         return;
       }
-      if (room.players.red && room.players.blue) {
-        send(client, { type: "error", message: "房间已满" });
+      if (room.players.blue && room.players.red) {
+        sendToSession(client.sessionId, { type: "error", message: "房间已满" });
         return;
       }
       const team = room.players.blue ? "red" : "blue";
-      room.players[team] = client.id;
-      client.roomCode = room.code;
-      client.team = team;
+      room.players[team] = createPlayerSlot(client.sessionId, client.name);
+      attachClientToSlot(client, room, team);
       broadcastRoom(room.code);
       break;
     }
-    case "room:leave": {
+    case "room:leave":
       leaveRoom(client);
-      send(client, { type: "room:left" });
+      sendToSession(client.sessionId, { type: "room:left" });
       break;
-    }
     case "room:update-config": {
       const room = rooms.get(client.roomCode);
       if (!room) {
         return;
       }
-      if (room.hostId !== client.id) {
-        send(client, { type: "error", message: "只有房主可以修改配置" });
+      if (room.hostSessionId !== client.sessionId) {
+        sendToSession(client.sessionId, { type: "error", message: "只有房主可以修改配置" });
         return;
       }
       if (room.state.phase !== "lobby") {
-        send(client, { type: "error", message: "比赛开始后不能修改配置" });
+        sendToSession(client.sessionId, { type: "error", message: "比赛开始后不能修改配置" });
         return;
       }
       room.config = sanitizeConfig(message.config || {});
@@ -504,6 +668,7 @@ function handleMessage(client, rawMessage) {
         targetQuestions: room.config.targetQuestions,
         difficulty: room.config.difficulty
       };
+      touchRoom(room);
       broadcastRoom(room.code);
       break;
     }
@@ -512,12 +677,16 @@ function handleMessage(client, rawMessage) {
       if (!room) {
         return;
       }
-      if (room.hostId !== client.id) {
-        send(client, { type: "error", message: "只有房主可以开始" });
+      if (room.hostSessionId !== client.sessionId) {
+        sendToSession(client.sessionId, { type: "error", message: "只有房主可以开始" });
         return;
       }
       if (!room.players.blue || !room.players.red) {
-        send(client, { type: "error", message: "需要两名玩家才能开始" });
+        sendToSession(client.sessionId, { type: "error", message: "需要两名玩家才能开始" });
+        return;
+      }
+      if (!room.players.blue.connected || !room.players.red.connected) {
+        sendToSession(client.sessionId, { type: "error", message: "两名玩家都在线时才能开始" });
         return;
       }
       startGame(room);
@@ -528,13 +697,41 @@ function handleMessage(client, rawMessage) {
       handleSubmit(client, message);
       break;
     default:
-      send(client, { type: "error", message: "未知消息类型" });
+      sendToSession(client.sessionId, { type: "error", message: "未知消息类型" });
       break;
   }
 }
 
+function cleanupRooms() {
+  const currentTime = now();
+  for (const room of rooms.values()) {
+    ["blue", "red"].forEach((team) => {
+      const slot = room.players[team];
+      if (!slot) {
+        return;
+      }
+      if (!slot.connected && slot.reconnectUntil && currentTime > slot.reconnectUntil) {
+        removePlayerFromRoom(room, team);
+      }
+    });
+
+    if (!rooms.has(room.code)) {
+      continue;
+    }
+
+    const bothEmpty = !room.players.blue && !room.players.red;
+    if (bothEmpty || currentTime - room.updatedAt > ROOM_IDLE_MS) {
+      clearGameTimer(room);
+      rooms.delete(room.code);
+    }
+  }
+}
+
 function safeResolve(urlPath) {
-  const cleanPath = decodeURIComponent(urlPath.split("?")[0]);
+  const cleanPath = decodeURIComponent((urlPath || "/").split("?")[0]);
+  if (cleanPath === "/healthz") {
+    return "__healthz__";
+  }
   const normalized = cleanPath === "/" ? "/public/index.html" : cleanPath;
   const absolutePath = path.normalize(path.join(ROOT, normalized));
   if (!absolutePath.startsWith(ROOT)) {
@@ -548,6 +745,17 @@ const server = http.createServer((req, res) => {
   if (!filePath) {
     res.writeHead(403);
     res.end("Forbidden");
+    return;
+  }
+
+  if (filePath === "__healthz__") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({
+      ok: true,
+      rooms: rooms.size,
+      clients: liveClients.size,
+      time: new Date().toISOString()
+    }));
     return;
   }
 
@@ -576,21 +784,47 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (socket) => {
   const client = {
-    id: createClientId(),
+    id: createId(8),
+    sessionId: createId(),
     socket,
     roomCode: null,
     team: null,
-    name: "玩家"
+    name: "玩家",
+    isAlive: true
   };
 
-  clients.set(client.id, client);
-  send(client, { type: "welcome", clientId: client.id });
+  liveClients.set(client.sessionId, client);
+  sendToSession(client.sessionId, { type: "welcome" });
 
+  socket.on("pong", () => {
+    client.isAlive = true;
+  });
   socket.on("message", (message) => handleMessage(client, message));
-  socket.on("close", () => detachClient(client));
-  socket.on("error", () => detachClient(client));
+  socket.on("close", () => disconnectClient(client));
+  socket.on("error", () => disconnectClient(client));
 });
 
+setInterval(() => {
+  for (const client of liveClients.values()) {
+    if (!client.isAlive) {
+      try {
+        client.socket.terminate();
+      } catch (error) {
+        disconnectClient(client);
+      }
+      continue;
+    }
+    client.isAlive = false;
+    try {
+      client.socket.ping();
+    } catch (error) {
+      disconnectClient(client);
+    }
+  }
+}, HEARTBEAT_INTERVAL_MS);
+
+setInterval(cleanupRooms, CLEANUP_INTERVAL_MS);
+
 server.listen(PORT, () => {
-  console.log(`TugofWarCounts online server running at http://localhost:${PORT}`);
+  console.log(`TugofWarCounts online server running at http://0.0.0.0:${PORT}`);
 });
